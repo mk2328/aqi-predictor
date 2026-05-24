@@ -5,54 +5,109 @@ from datetime import datetime, timezone, timedelta
 from supabase import create_client
 
 # ── Config ──────────────────────────────────────────────
+AQICN_TOKEN       = os.environ["AQICN_TOKEN"]
 OPENWEATHER_TOKEN = os.environ["OPENWEATHER_TOKEN"]
 SUPABASE_URL      = os.environ["SUPABASE_URL"]
 SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
 
-LAT  = 24.8607
-LON  = 67.0011
-CITY = "karachi"
-
+LAT          = 24.8607
+LON          = 67.0011
+CITY         = "karachi"
 BACKFILL_DAYS = 90
-CHUNK_DAYS    = 30  # fetch 30 days at a time
+CHUNK_DAYS    = 30
 
-# ── Fetch historical air pollution ───────────────────────
-def fetch_historical_pollution(start_ts: int, end_ts: int) -> list:
+# ── Fetch AQICN current AQI (real continuous value) ─────
+def fetch_aqicn_aqi() -> float:
+    url = f"https://api.waqi.info/feed/karachi/?token={AQICN_TOKEN}"
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if data["status"] == "ok":
+            return float(data["data"]["aqi"])
+    except:
+        pass
+    return None
+
+# ── Fetch AQICN forecast data ────────────────────────────
+def fetch_aqicn_forecast() -> dict:
+    """Returns dict of {date_str: avg_pm25} from AQICN forecast"""
+    url = f"https://api.waqi.info/feed/karachi/?token={AQICN_TOKEN}"
+    forecast_map = {}
+    try:
+        r    = requests.get(url, timeout=10)
+        data = r.json()
+        if data["status"] == "ok":
+            forecast = data["data"].get("forecast", {}).get("daily", {})
+            pm25_forecast = forecast.get("pm25", [])
+            for item in pm25_forecast:
+                forecast_map[item["day"]] = item["avg"]
+    except:
+        pass
+    return forecast_map
+
+# ── Fetch OpenWeather historical pollution ───────────────
+def fetch_ow_pollution(start_ts: int, end_ts: int) -> list:
     url = (
         f"http://api.openweathermap.org/data/2.5/air_pollution/history"
         f"?lat={LAT}&lon={LON}"
         f"&start={start_ts}&end={end_ts}"
         f"&appid={OPENWEATHER_TOKEN}"
     )
-    for attempt in range(3):  # retry 3 times
+    for attempt in range(3):
         try:
-            response = requests.get(url, timeout=60)
-            response.raise_for_status()
-            return response.json().get("list", [])
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            return r.json().get("list", [])
         except Exception as e:
             print(f"   ⚠️  Attempt {attempt+1} failed: {e}")
             time.sleep(5)
     return []
 
-# ── Compute features ─────────────────────────────────────
-def compute_features(entry: dict) -> dict:
+# ── AQI from PM25 using US EPA formula ──────────────────
+def pm25_to_aqi(pm25: float) -> float:
+    """Convert PM2.5 concentration to US AQI"""
+    breakpoints = [
+        (0.0,   12.0,   0,   50),
+        (12.1,  35.4,   51,  100),
+        (35.5,  55.4,   101, 150),
+        (55.5,  150.4,  151, 200),
+        (150.5, 250.4,  201, 300),
+        (250.5, 350.4,  301, 400),
+        (350.5, 500.4,  401, 500),
+    ]
+    for (c_low, c_high, i_low, i_high) in breakpoints:
+        if c_low <= pm25 <= c_high:
+            aqi = ((i_high - i_low) / (c_high - c_low)) * (pm25 - c_low) + i_low
+            return round(aqi, 1)
+    return 500.0
+
+# ── Compute features from one OW pollution entry ────────
+def compute_features(entry: dict, prev_aqi: float) -> dict:
     dt         = datetime.fromtimestamp(entry["dt"], tz=timezone.utc)
     components = entry.get("components", {})
 
-    ow_aqi  = entry.get("main", {}).get("aqi", 1)
-    aqi_map = {1: 25, 2: 75, 3: 125, 4: 175, 5: 250}
-    aqi     = aqi_map.get(ow_aqi, 25)
+    pm25 = components.get("pm2_5", 0.0)
+    pm10 = components.get("pm10",  0.0)
+    o3   = components.get("o3",    0.0)
+    no2  = components.get("no2",   0.0)
+    co   = components.get("co",    0.0)
+    so2  = components.get("so2",   0.0)
+
+    # Use EPA formula for continuous AQI from pm25
+    aqi = pm25_to_aqi(pm25) if pm25 > 0 else pm25_to_aqi(10)
+
+    aqi_change_rate = (aqi - prev_aqi) if prev_aqi is not None else 0.0
 
     return {
         "timestamp":       dt.isoformat(),
         "city":            CITY,
         "aqi":             aqi,
-        "pm25":            components.get("pm2_5", 0.0),
-        "pm10":            components.get("pm10",  0.0),
-        "o3":              components.get("o3",    0.0),
-        "no2":             components.get("no2",   0.0),
-        "co":              components.get("co",    0.0),
-        "so2":             components.get("so2",   0.0),
+        "pm25":            pm25,
+        "pm10":            pm10,
+        "o3":              o3,
+        "no2":             no2,
+        "co":              co,
+        "so2":             so2,
         "temperature":     0.0,
         "humidity":        0.0,
         "pressure":        0.0,
@@ -60,10 +115,10 @@ def compute_features(entry: dict) -> dict:
         "hour":            dt.hour,
         "day":             dt.weekday(),
         "month":           dt.month,
-        "aqi_change_rate": 0.0,
+        "aqi_change_rate": aqi_change_rate,
     }
 
-# ── Store batch in Supabase ──────────────────────────────
+# ── Store batch ──────────────────────────────────────────
 def store_batch(supabase, rows: list):
     if not rows:
         return
@@ -78,32 +133,27 @@ if __name__ == "__main__":
     end_dt   = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=BACKFILL_DAYS)
 
-    print(f"📅 Backfilling {BACKFILL_DAYS} days in {CHUNK_DAYS}-day chunks")
+    print(f"📅 Backfilling {BACKFILL_DAYS} days with EPA AQI formula")
+    print(f"   {start_dt.date()} → {end_dt.date()}\n")
 
     total_stored = 0
     chunk_start  = start_dt
+    prev_aqi     = None
 
     while chunk_start < end_dt:
         chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end_dt)
+        print(f"🔄 Fetching: {chunk_start.date()} → {chunk_end.date()}")
 
-        print(f"\n🔄 Fetching: {chunk_start.date()} → {chunk_end.date()}")
-
-        pollution_list = fetch_historical_pollution(
+        pollution_list = fetch_ow_pollution(
             int(chunk_start.timestamp()),
             int(chunk_end.timestamp())
         )
         print(f"   Got {len(pollution_list)} readings")
 
-        batch    = []
-        prev_aqi = None
-
+        batch = []
         for entry in pollution_list:
-            features = compute_features(entry)
-
-            if prev_aqi is not None:
-                features["aqi_change_rate"] = float(features["aqi"]) - float(prev_aqi)
+            features = compute_features(entry, prev_aqi)
             prev_aqi = features["aqi"]
-
             batch.append(features)
 
             if len(batch) >= 100:
@@ -115,8 +165,8 @@ if __name__ == "__main__":
             store_batch(supabase, batch)
             total_stored += len(batch)
 
-        print(f"   ✅ Chunk stored! Total so far: {total_stored}")
+        print(f"   ✅ Chunk stored! Total: {total_stored}")
         chunk_start = chunk_end
-        time.sleep(2)  # small pause between chunks
+        time.sleep(2)
 
-    print(f"\n🎉 Backfill complete! {total_stored} total rows stored.")
+    print(f"\n🎉 Backfill complete! {total_stored} rows with real AQI values.")
