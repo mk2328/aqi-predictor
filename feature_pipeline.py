@@ -5,51 +5,65 @@ from datetime import datetime, timezone
 from supabase import create_client
 
 # ── Config ──────────────────────────────────────────────
-AQICN_TOKEN   = os.environ["AQICN_TOKEN"]
-SUPABASE_URL  = os.environ["SUPABASE_URL"]
-SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
+OPENWEATHER_TOKEN = os.environ["OPENWEATHER_TOKEN"]
+SUPABASE_URL      = os.environ["SUPABASE_URL"]
+SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
 
-CITY = "karachi"   # change to your city if needed
+# Karachi coordinates
+LAT  = 24.8607
+LON  = 67.0011
+CITY = "karachi"
 
-# ── Step 1: Fetch raw data from AQICN ───────────────────
-def fetch_aqi_data(city: str) -> dict:
-    url = f"https://api.waqi.info/feed/{city}/?token={AQICN_TOKEN}"
+# ── Step 1A: Fetch Air Pollution data ───────────────────
+def fetch_air_pollution() -> dict:
+    url = (
+        f"http://api.openweathermap.org/data/2.5/air_pollution"
+        f"?lat={LAT}&lon={LON}&appid={OPENWEATHER_TOKEN}"
+    )
     response = requests.get(url, timeout=10)
     response.raise_for_status()
     data = response.json()
-    if data["status"] != "ok":
-        raise ValueError(f"AQICN error: {data}")
-    return data["data"]
+    return data["list"][0]
+
+# ── Step 1B: Fetch Weather data ──────────────────────────
+def fetch_weather() -> dict:
+    url = (
+        f"https://api.openweathermap.org/data/2.5/weather"
+        f"?lat={LAT}&lon={LON}&appid={OPENWEATHER_TOKEN}&units=metric"
+    )
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    return response.json()
 
 # ── Step 2: Compute features ────────────────────────────
-def compute_features(raw: dict) -> dict:
-    iaqi = raw.get("iaqi", {})
-    now  = datetime.now(timezone.utc)
+def compute_features(pollution: dict, weather: dict) -> dict:
+    now        = datetime.now(timezone.utc)
+    components = pollution.get("components", {})
 
-    # pull pollutants & weather (default 0 if missing)
-    aqi         = raw.get("aqi", 0)
-    pm25        = iaqi.get("pm25", {}).get("v", 0)
-    pm10        = iaqi.get("pm10", {}).get("v", 0)
-    o3          = iaqi.get("o3",   {}).get("v", 0)
-    no2         = iaqi.get("no2",  {}).get("v", 0)
-    co          = iaqi.get("co",   {}).get("v", 0)
-    so2         = iaqi.get("so2",  {}).get("v", 0)
-    temperature = iaqi.get("t",    {}).get("v", 0)
-    humidity    = iaqi.get("h",    {}).get("v", 0)
-    pressure    = iaqi.get("p",    {}).get("v", 0)
-    wind        = iaqi.get("w",    {}).get("v", 0)
+    # OpenWeather AQI: 1=Good, 2=Fair, 3=Moderate, 4=Poor, 5=Very Poor
+    # Convert to US AQI scale (approximate)
+    ow_aqi = pollution.get("main", {}).get("aqi", 1)
+    aqi_map = {1: 25, 2: 75, 3: 125, 4: 175, 5: 250}
+    aqi = aqi_map.get(ow_aqi, 25)
 
-    # pm25 should not equal overall AQI
-    if pm25 == aqi:
-        pm25 = 0.0
+    # Pollutants (µg/m³)
+    pm25 = components.get("pm2_5", 0.0)
+    pm10 = components.get("pm10",  0.0)
+    o3   = components.get("o3",    0.0)
+    no2  = components.get("no2",   0.0)
+    co   = components.get("co",    0.0)
+    so2  = components.get("so2",   0.0)
 
-    # time-based features
+    # Weather
+    temperature = weather.get("main", {}).get("temp",     0.0)
+    humidity    = weather.get("main", {}).get("humidity", 0.0)
+    pressure    = weather.get("main", {}).get("pressure", 0.0)
+    wind        = weather.get("wind", {}).get("speed",    0.0)
+
+    # Time-based features
     hour  = now.hour
-    day   = now.weekday()   # 0=Monday … 6=Sunday
+    day   = now.weekday()
     month = now.month
-
-    # derived feature — placeholder (real rate needs previous row)
-    aqi_change_rate = 0.0
 
     return {
         "timestamp":       now.isoformat(),
@@ -68,12 +82,11 @@ def compute_features(raw: dict) -> dict:
         "hour":            hour,
         "day":             day,
         "month":           month,
-        "aqi_change_rate": aqi_change_rate,
+        "aqi_change_rate": 0.0,
     }
 
-# ── Step 3: Calculate real AQI change rate ──────────────
+# ── Step 3: Calculate AQI change rate ───────────────────
 def add_change_rate(supabase, features: dict) -> dict:
-    """Fetch the last row from Supabase and compute change rate."""
     result = (
         supabase.table("aqi_features")
         .select("aqi, timestamp")
@@ -89,23 +102,23 @@ def add_change_rate(supabase, features: dict) -> dict:
 
 # ── Step 4: Store in Supabase ────────────────────────────
 def store_features(supabase, features: dict):
-    result = (
-        supabase.table("aqi_features")
-        .upsert(features, on_conflict="timestamp,city")
+    supabase.table("aqi_features") \
+        .upsert(features, on_conflict="timestamp,city") \
         .execute()
-    )
-    print(f"✅ Stored: AQI={features['aqi']} at {features['timestamp']}")
-    return result
+    print(f"✅ Stored | AQI={features['aqi']} | "
+          f"PM2.5={features['pm25']} | "
+          f"Temp={features['temperature']}°C | "
+          f"at {features['timestamp']}")
 
 # ── Main ─────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"🌍 Fetching AQI data for {CITY}...")
+    print(f"🌍 Fetching real-time data for {CITY}...")
 
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    raw      = fetch_aqi_data(CITY)
-    features = compute_features(raw)
-    features = add_change_rate(supabase, features)
+    supabase  = create_client(SUPABASE_URL, SUPABASE_KEY)
+    pollution = fetch_air_pollution()
+    weather   = fetch_weather()
+    features  = compute_features(pollution, weather)
+    features  = add_change_rate(supabase, features)
     store_features(supabase, features)
 
     print("🎉 Feature pipeline complete!")

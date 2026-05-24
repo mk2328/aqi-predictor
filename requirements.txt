@@ -1,3 +1,7 @@
 requests
 pandas
 supabase
+scikit-learn
+shap
+joblib
+streamlit
