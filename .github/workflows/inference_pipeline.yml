@@ -1,0 +1,68 @@
+name: Inference Pipeline
+
+on:
+  # Run after feature pipeline completes
+  workflow_run:
+    workflows: ["Feature Pipeline"]
+    types: [completed]
+
+  # Also run on a schedule: every hour at :30 (offset from feature pipeline)
+  schedule:
+    - cron: "30 * * * *"
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  run-inference:
+    runs-on: ubuntu-latest
+    # Only run if triggered by workflow_run AND it succeeded
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download latest models from Supabase Storage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          mkdir -p models
+          python - <<'EOF'
+          import os, requests
+          # Download best_model.pkl
+          url = f"{os.environ['SUPABASE_URL']}/storage/v1/object/public/models/best_model.pkl"
+          r = requests.get(url)
+          if r.status_code == 200:
+              with open("models/best_model.pkl", "wb") as f: f.write(r.content)
+              print("✅ Downloaded best_model.pkl")
+          else:
+              print("⚠️  Model not in storage, using repo copy")
+          # Download scaler.pkl
+          url2 = f"{os.environ['SUPABASE_URL']}/storage/v1/object/public/models/scaler.pkl"
+          r2 = requests.get(url2)
+          if r2.status_code == 200:
+              with open("models/scaler.pkl", "wb") as f: f.write(r2.content)
+              print("✅ Downloaded scaler.pkl")
+          EOF
+          # Fallback: copy from repo if download failed
+          [ -f models/best_model.pkl ] || cp models/best_model.pkl models/best_model.pkl 2>/dev/null || true
+          [ -f models/scaler.pkl ]     || cp models/scaler.pkl models/scaler.pkl 2>/dev/null || true
+
+      - name: Run Inference Pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python pipelines/inference_pipeline.py
