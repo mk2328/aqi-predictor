@@ -25,4 +25,4 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python training_pipeline.py
+        run: python pipelines/training_pipeline.py

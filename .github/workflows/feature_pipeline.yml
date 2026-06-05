@@ -27,4 +27,4 @@ jobs:
           AQICN_TOKEN:       ${{ secrets.AQICN_TOKEN }}
           SUPABASE_URL:      ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY:      ${{ secrets.SUPABASE_KEY }}
-        run: python feature_pipeline.py
+        run: python pipelines/feature_pipeline.py
