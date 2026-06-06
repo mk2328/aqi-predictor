@@ -23,7 +23,7 @@ MODEL_PATH    = "models/best_model.pkl"
 SCALER_PATH   = "models/scaler.pkl"
 SHAP_PATH     = "models/shap_values.json"
 
-FORECAST_HORIZON = 72  # 3 days ahead
+FORECAST_HORIZON = 24  # 3 days ahead
 
 # ── Step 1: Fetch data from Supabase ────────────────────
 def fetch_features(supabase) -> pd.DataFrame:
@@ -133,8 +133,9 @@ def compute_shap(best: dict, X_train, X_test, feature_cols) -> dict:
             if len(np.array(shap_vals).shape) == 3:
                 shap_vals = np.mean(shap_vals, axis=2)
         else:
-            explainer = shap.Explainer(model, X_train)
-            shap_vals = explainer(X_test).values
+            background = shap.sample(X_train, 100)
+            explainer = shap.KernelExplainer(model.predict, background)
+            shap_vals = explainer.shap_values(X_test[:50], nsamples=100)
 
         mean_abs = np.abs(shap_vals).mean(axis=0).tolist()
         top5 = sorted(zip(feature_cols, mean_abs), key=lambda x: x[1], reverse=True)[:5]
@@ -197,6 +198,25 @@ def save_best_model(supabase, best: dict, scaler, shap_dict: dict, version: int,
         "horizon":    FORECAST_HORIZON
     }).execute()
     print(f"✅ Model v{version} (Horizon: {FORECAST_HORIZON}h) registered in Supabase!")
+
+    # ── Auto upload to Supabase Storage ──────────────────
+    print("\n☁️  Uploading models to Supabase Storage...")
+    try:
+        for file_path, storage_name in [
+            (MODEL_PATH,  "best_model.pkl"),
+            (SCALER_PATH, "scaler.pkl"),
+            ("models/feature_cols.json", "feature_cols.json"),
+        ]:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            supabase.storage.from_("models").upload(
+                path=storage_name,
+                file=file_bytes,
+                file_options={"upsert": "true"}
+            )
+            print(f"   ✅ Uploaded: {storage_name}")
+    except Exception as e:
+        print(f"   ⚠️ Storage upload failed: {e}")
 
 
 # ── Main ────────────────────────────────────────────────
