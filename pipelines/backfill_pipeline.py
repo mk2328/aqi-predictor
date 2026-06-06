@@ -3,6 +3,7 @@ import time
 import requests
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
+import pandas as pd
 
 # ── Config ──────────────────────────────────────────────
 AQICN_TOKEN       = os.environ["AQICN_TOKEN"]
@@ -110,48 +111,79 @@ def store_batch(supabase, rows: list):
         .upsert(rows, on_conflict="timestamp,city") \
         .execute()
 
-# ── Main ────────────────────────────────────────────────
 if __name__ == "__main__":
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    end_dt   = datetime.now(timezone.utc)
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    
+    # 1. Initialize variables correctly
+    end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=BACKFILL_DAYS)
-
+    
     print(f"📅 Backfilling {BACKFILL_DAYS} days for Karachi...")
-    print(f"   Period: {start_dt.date()} → {end_dt.date()}")
-    print(f"   ✅ Using Karachi monthly climate averages for weather\n")
-
-    total_stored = 0
-    chunk_start  = start_dt
-    prev_aqi     = None
-
+    
+    all_data = []
+    chunk_start = start_dt
+    prev_aqi = None
+    
+    # 2. Fetch logic
     while chunk_start < end_dt:
         chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end_dt)
-        print(f"🔄 Fetching chunk: {chunk_start.date()} → {chunk_end.date()}")
-
-        pollution_list = fetch_ow_pollution(
-            int(chunk_start.timestamp()),
-            int(chunk_end.timestamp())
-        )
-        print(f"   Got {len(pollution_list)} readings")
-
-        batch = []
+        print(f"🔄 Fetching: {chunk_start.date()} to {chunk_end.date()}")
+        
+        pollution_list = fetch_ow_pollution(int(chunk_start.timestamp()), int(chunk_end.timestamp()))
+        
         for entry in pollution_list:
             features = compute_features(entry, prev_aqi)
             prev_aqi = features["aqi"]
-            batch.append(features)
-
-            if len(batch) >= 100:
-                store_batch(supabase, batch)
-                total_stored += len(batch)
-                batch = []
-
-        if batch:
-            store_batch(supabase, batch)
-            total_stored += len(batch)
-
-        print(f"   ✅ Chunk stored | Total: {total_stored}")
+            all_data.append(features)
+        
         chunk_start = chunk_end
         time.sleep(2)
 
-    print(f"\n🎉 Backfill complete! {total_stored} rows stored with real weather data.")
+    # 3. Data Cleaning & Rolling Mean (Crucial for model stability)
+    df = pd.DataFrame(all_data)
+    
+    # Filter outliers
+    df = df[(df['aqi'] >= 30) & (df['aqi'] <= 350)].copy()
+    
+    # Rolling Mean for smoother prediction
+    df['aqi_rolling_mean'] = df['aqi'].rolling(window=3, min_periods=1).mean()
+    
+    # 4. Final Upsert (Handles new and updates existing records)
+    final_data = df.to_dict(orient='records')
+    store_batch(supabase, final_data)
+    
+    print(f"\n🎉 Success! {len(final_data)} rows cleaned and stored.")
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # ... (rest of config)
+    
+    # 1. Fetch data into a temporary list first
+    all_data = []
+    chunk_start = start_dt
+    prev_aqi = None
+    
+    while chunk_start < end_dt:
+        chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end_dt)
+        pollution_list = fetch_ow_pollution(int(chunk_start.timestamp()), int(chunk_end.timestamp()))
+        
+        for entry in pollution_list:
+            features = compute_features(entry, prev_aqi)
+            prev_aqi = features["aqi"]
+            all_data.append(features)
+        
+        chunk_start = chunk_end
+
+    # 2. Convert to DataFrame for Cleaning & Rolling Mean
+    df = pd.DataFrame(all_data)
+    
+    # 3. 🧹 Outlier Removal
+    df = df[(df['aqi'] >= 30) & (df['aqi'] <= 350)]
+    
+    # 4. 📈 Add Rolling Mean (The "Trend" Feature)
+    # Yeh aapke model ko noise se bachaey ga
+    df['aqi_rolling_mean'] = df['aqi'].rolling(window=3, min_periods=1).mean()
+    
+    # 5. Convert back to list of dicts and Store
+    final_data = df.to_dict(orient='records')
+    store_batch(supabase, final_data) # Aapka existing store_batch function use karein
+    
+    print(f"\n🎉 Backfill complete! {len(final_data)} clean rows with rolling mean stored.")
